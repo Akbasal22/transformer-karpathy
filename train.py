@@ -1,6 +1,6 @@
 import tensorflow as tf
 import numpy as np
-from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
 import random
 
 
@@ -237,6 +237,12 @@ def main():
                     validation_data=val_ds,
                     epochs=20)  # adjust epochs
     model.save("transformer_model.h5")  # HDF5 format
+    plt.plot(history.history["val_loss"], label="Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Validation Loss vs. Epoch")
+    plt.legend()
+    plt.show()
     generate_text(model, "The sea is")
     
  
