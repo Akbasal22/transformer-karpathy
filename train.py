@@ -1,39 +1,39 @@
 import tensorflow as tf
+from tensorflow.keras.metrics import SparseCategoricalAccuracy
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+from tokenizers import Tokenizer
 
 
 # open input.txt
-f = open('input.txt', 'r', encoding='utf-8')
+f = open('/content/drive/MyDrive/shakegpt/input.txt', 'r', encoding='utf-8')
 text = f.read()
 chars = sorted(list(set(text)))
 
+#load tokenizer
+tok = Tokenizer.from_file("/content/drive/MyDrive/shakegpt/bpe_tokenizer.json")
+
 
 #global variables
-block_size = 8
-batch_size = 4
-vocab_size = len(chars)
-n_embed = 32
-head_size = 16
+block_size = 128
+batch_size = 64
+vocab_size = tok.get_vocab_size()
+n_embed = 96
 dropout = 0.2
-num_heads = 8
-epochs = 5000
-eval_interval = 500
-n_layers = 8
-learning_rate = 3e-4
+num_heads = 6
+n_layers = 6
+learning_rate = 1e-4
+head_size = n_embed//num_heads
 
 
 
 ##I will improve this with regex helped byte pair encoding,
-stoi = {ch:i for i,ch in enumerate(chars)}
-itos = {i:ch for i,ch in enumerate(chars)}
 def encode(text):
-    return [stoi[char] for char in text]
-def decode(tokens):
-    text = "".join(itos[token] for token in tokens)
-    return text
+    return tok.encode(text).ids
 
+def decode(ids):
+    return tok.decode(ids)
 
 #split data
 data = np.array(encode(text))
@@ -65,8 +65,9 @@ class Head(tf.keras.layers.Layer):
         #calculate q@k.T
         wei = tf.matmul(q, k, transpose_b=True) * (head_size ** -0.5)
         #mask upper triangle indices for softmax
-        mask = tf.linalg.band_part(tf.ones((T, T)), -1, 0)
-        wei = tf.where(mask == 0, tf.fill(tf.shape(wei), -float('inf')), wei)
+        mask = tf.linalg.band_part(tf.ones((T, T)), -1, 0)  # (T, T)
+        mask = tf.expand_dims(mask, 0)                      # (1, T, T)
+        wei = tf.where(mask == 0, tf.fill(tf.shape(wei), -1e9), wei)
         #softmax
         wei = tf.nn.softmax(wei, axis=-1)
         wei = self.dropout(wei)
@@ -88,7 +89,8 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         self.dropout = tf.keras.layers.Dropout(dropout)
     def call(self,x):
         out = tf.concat([h(x) for h in self.heads], axis=-1)
-        out = self.proj(self.dropout(out))
+        out = self.proj(out)
+        out = self.dropout(out)
         return out
 
 
@@ -120,27 +122,48 @@ class Block(tf.keras.layers.Layer):
 
     def call(self, x):
         x = x + self.sa(self.ln1(x))
-        x += x + self.mlp(self.ln2(x))
+        x = x + self.mlp(self.ln2(x))
         return x
     
 
 class Transformer(tf.keras.Model):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, vocab_size, n_embed, block_size, n_layers, num_heads, **kwargs):
+        super().__init__(**kwargs)
+        initializer = tf.keras.initializers.TruncatedNormal(stddev=0.02)
         #I should initalize these two in tensorflow layer type
-        self.token_embedding_table =tf.keras.layers.Embedding(input_dim = vocab_size, output_dim = n_embed)
-        self.position_embedding_table = tf.keras.layers.Embedding(input_dim = block_size, output_dim = n_embed)
+        self.token_embedding_table = tf.keras.layers.Embedding(
+            input_dim=vocab_size, output_dim=n_embed,
+            embeddings_initializer=initializer
+        )
+        self.position_embedding_table = tf.keras.layers.Embedding(
+            input_dim=block_size, output_dim=n_embed,
+            embeddings_initializer=initializer
+        )
+
+        self.lm_head = tf.keras.layers.Dense(
+            vocab_size, kernel_initializer=initializer
+        )
 
 
-        self.blocks = [Block(n_embed, num_heads) for _ in range(n_layers)]
+        self.blocks = tf.keras.Sequential([Block(n_embed, num_heads) for _ in range(n_layers)])
         self.ln_f = tf.keras.layers.LayerNormalization()
+
+        self.vocab_size = vocab_size
+        self.n_embed = n_embed
+        self.block_size = block_size
+        self.n_layers = n_layers
+        self.num_heads = num_heads
         
-        #what is this self.lm_head?
-        self.lm_head = tf.keras.layers.Dense(units=vocab_size)
-
-        #how to initialize weights?
-
-    #what is this idx parameter in forward method
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "vocab_size": self.vocab_size,
+            "n_embed": self.n_embed,
+            "block_size": self.block_size,
+            "n_layers": self.n_layers,
+            "num_heads": self.num_heads,
+        })
+        return config
     def call(self, idx, targets = None):
         T = tf.shape(idx)[1]
         tok_emb = self.token_embedding_table(idx)
@@ -148,41 +171,22 @@ class Transformer(tf.keras.Model):
         pos_emb = self.position_embedding_table(positions)
         pos_emb = tf.expand_dims(pos_emb, axis=0)
         x = tok_emb + pos_emb
-
-
-        for block in self.blocks:
-            x = block(x)
-        # why not directly x = self.blocks(x)
-
-
+        x = self.blocks(x)
         x = self.ln_f(x)
         logits = self.lm_head(x)
-        
-
-        #what does this do?
-        # if not targets:
-        #     loss = None
-        # else :
-        #     flat_logits = tf.reshape(logits, (-1, self.vocab_size))
-        #     flat_targets = tf.reshape(targets, (-1,))
-        #     scce = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
-        #     per_example_loss = scce(flat_targets, flat_logits)  # (B*T,)
-        #     loss = tf.reduce_mean(per_example_loss)
 
         return logits
 
 
-    #copy pasted from gpt have no idea what it does
-    # optional generation method (greedy sampling with optional top_k)
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=0.8, top_k=None):
         """
         idx: tensor (B, T) initial context
         returns: tensor (B, T + max_new_tokens) with generated tokens appended
         """
         for _ in range(max_new_tokens):
             # crop context to block_size
-            idx_cond = idx[:, -self.block_size:]
-            logits, _ = self.call(idx_cond, training=False)  # (B, T', vocab)
+            idx_cond = idx[:, -block_size:] #take last block_size tokens
+            logits = self.call(idx_cond)  # (B, T', vocab) run the model to get logits
             logits = logits[:, -1, :]  # (B, vocab) take last time step
             logits = logits / (tf.cast(temperature, tf.float32) + 1e-9)
 
@@ -218,25 +222,24 @@ train_ds = make_dataset(train_set, block_size, batch_size, shuffle=True)
 val_ds   = make_dataset(test_set, block_size, batch_size, shuffle=False)
 
 def generate_text(model, start_text, max_new_tokens=100, temperature=1.0, top_k=None):
-    # encode start text to tokens
     idx = tf.constant([encode(start_text)], dtype=tf.int32)
-    # generate
     idx = model.generate(idx, max_new_tokens=max_new_tokens,
                          temperature=temperature, top_k=top_k)
-    # decode back to string
-    return decode(idx.numpy()[0])
+    return decode(idx.numpy()[0]).tolist()
 
 def main():
-    model = Transformer()
+    model = Transformer(vocab_size, n_embed, block_size, n_layers, num_heads)
 
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
 
-    model.compile(optimizer=optimizer, loss=loss_fn, metrics=['accuracy'])
+    
+    model.compile(optimizer=optimizer,loss=loss_fn,metrics=[SparseCategoricalAccuracy()])
     history = model.fit(train_ds,
                     validation_data=val_ds,
-                    epochs=20)  # adjust epochs
-    model.save("transformer_model.h5")  # HDF5 format
+                    epochs=10) 
+    # model.save("model.h5")  # HDF5 format
+    model.save("/content/drive/MyDrive/shakegpt/model.keras") #keras format  
     plt.plot(history.history["val_loss"], label="Validation Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
@@ -244,9 +247,17 @@ def main():
     plt.legend()
     plt.show()
     generate_text(model, "The sea is")
-    
- 
 
+my_model = tf.keras.models.load_model(
+    "model.keras",
+    custom_objects={
+        "Transformer": Transformer,
+        "Block": Block,
+        "Head": Head,
+        "MultiHeadAttention": MultiHeadAttention,
+        "MLP": MLP
+    },
+)
 
-
+generate_text(my_model, "Oh great")
 main()
